@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconocimiento Facial - Registro de Personal</title>
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: #f1f5f9; color: #1e293b; }
+  .wrap { max-width: 460px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 15px; text-transform: uppercase; letter-spacing: .5px; color: #334155; text-align: center; margin: 10px 0 18px; }
+  .card { background: #fff; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.06); margin-bottom: 16px; }
+  label { display: block; font-size: 12px; color: #64748b; margin-bottom: 4px; }
+  select { width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; font-family: inherit; margin-bottom: 4px; }
+  .video-wrap { position: relative; width: 100%; max-width: 320px; margin: 14px auto; border-radius: 10px; overflow: hidden; background: #0f172a; aspect-ratio: 4/3; }
+  .video-wrap video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
+  .status { text-align: center; font-size: 13px; color: #64748b; min-height: 18px; margin-top: 6px; }
+  .status.ok { color: #047857; font-weight: 700; }
+  .status.warn { color: #b45309; font-weight: 600; }
+  .status.err { color: #e11d48; font-weight: 600; }
+  button { cursor: pointer; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; padding: 11px 14px; font-family: inherit; width: 100%; }
+  button:disabled { background: #cbd5e1 !important; cursor: not-allowed; }
+  .btn-primary { background: #1e293b; color: #fff; }
+  .log { font-size: 12px; color: #475569; border-top: 1px solid #e2e8f0; padding-top: 10px; margin-top: 10px; }
+  .log-item { display: flex; justify-content: space-between; padding: 4px 0; }
+  .log-item .tag { font-weight: 700; }
+  .log-item .tag.ent { color: #059669; }
+  .log-item .tag.sal { color: #2563eb; }
+  .clock { text-align: center; font-size: 28px; font-weight: 700; color: #1e293b; margin-bottom: 4px; }
+  .cfgnote { font-size: 11px; color: #94a3b8; text-align: center; margin-top: 14px; }
+  .cfgnote code { background: #f1f5f9; padding: 1px 4px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Registro de Personal · Reconocimiento Facial</h1>
+
+  <div class="card">
+    <div class="clock" id="reloj">--:--:--</div>
+    <label for="empresaSelect">Empresa</label>
+    <select id="empresaSelect"></select>
+
+    <div class="video-wrap">
+      <video id="video" autoplay muted playsinline></video>
+    </div>
+    <div class="status" id="status">Selecciona una empresa para comenzar.</div>
+    <button class="btn-primary" id="toggleBtn" disabled>Activar cámara</button>
+  </div>
+
+  <div class="card">
+    <strong style="font-size:12px; color:#334155; text-transform:uppercase;">Últimos registros</strong>
+    <div class="log" id="log"><div style="color:#94a3b8;">Aún no hay registros en esta sesión.</div></div>
+  </div>
+
+  <div class="cfgnote">
+    Backend: <code id="urlLabel">sin configurar</code> ·
+    <a href="#" id="linkKiosko" style="color:#94a3b8;">Ir a la app principal</a>
+  </div>
+</div>
+
+<script>
+  // =====================================================================
+  // CONFIGURACION: pega aqui la URL de tu Web App de Apps Script
+  // (Implementar > Gestionar implementaciones > copiar "URL de la app web",
+  // debe terminar en /exec)
+  // =====================================================================
+  const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyZVzV_VAwL-r1rGLJdC-ZzkIeeIyUDFILXvU-lxtHbU3XaQRFU3tjYR8OjVb99bHrU/exec';
+  // =====================================================================
+
+  const FACE_MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
+  const FACE_MATCH_THRESHOLD = 0.55;
+  const RECONOCIMIENTO_COOLDOWN_MS = 5000;
+
+  let empleadosCache = [];
+  let motivosEntrada = [];
+  let motivosSalida = [];
+  let modelsReady = false;
+  let stream = null;
+  let loopTimer = null;
+  let ultimoMatchId = null;
+  let ultimoMatchDesde = 0;
+  let procesando = false;
+
+  const statusEl = document.getElementById('status');
+  const toggleBtn = document.getElementById('toggleBtn');
+  const empresaSelect = document.getElementById('empresaSelect');
+  const video = document.getElementById('video');
+  const logEl = document.getElementById('log');
+
+  document.getElementById('urlLabel').textContent = APPS_SCRIPT_URL.indexOf('PEGA_AQUI') === -1 ? 'configurado' : 'sin configurar';
+  document.getElementById('linkKiosko').href = APPS_SCRIPT_URL.replace(/\/exec.*/, '/exec');
+
+  function setStatus(msg, cls) {
+    statusEl.className = 'status' + (cls ? ' ' + cls : '');
+    statusEl.textContent = msg;
+  }
+
+  function tick() {
+    const n = new Date();
+    const pad = function (x) { return String(x).padStart(2, '0'); };
+    document.getElementById('reloj').textContent = pad(n.getHours()) + ':' + pad(n.getMinutes()) + ':' + pad(n.getSeconds());
+  }
+  setInterval(tick, 1000); tick();
+
+  // ---- Llamadas al backend (Content-Type text/plain evita el preflight CORS) ----
+  async function callBackend(payload) {
+    if (APPS_SCRIPT_URL.indexOf('PEGA_AQUI') !== -1) {
+      throw new Error('Falta configurar APPS_SCRIPT_URL en este archivo.');
+    }
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Error desconocido del servidor.');
+    return data;
+  }
+
+  async function cargarEmpresas() {
+    setStatus('Cargando empresas...', '');
+    try {
+      const data = await callBackend({ action: 'getCompanies' });
+      empresaSelect.innerHTML = '';
+      data.companies.forEach(function (c) {
+        const opt = document.createElement('option');
+        opt.value = c.id; opt.textContent = c.nombre;
+        empresaSelect.appendChild(opt);
+      });
+      if (data.companies.length === 0) {
+        setStatus('No hay empresas configuradas todavía.', 'warn');
+        return;
+      }
+      const guardada = localStorage.getItem('facial_empresaId');
+      if (guardada && data.companies.some(function (c) { return String(c.id) === guardada; })) {
+        empresaSelect.value = guardada;
+      }
+      await cargarRostrosEmpresa();
+    } catch (e) {
+      setStatus('No se pudo conectar con el backend: ' + e.message, 'err');
+    }
+  }
+
+  async function cargarRostrosEmpresa() {
+    const empresaId = empresaSelect.value;
+    if (!empresaId) return;
+    localStorage.setItem('facial_empresaId', empresaId);
+    setStatus('Cargando empleados de la empresa...', '');
+    try {
+      const data = await callBackend({ action: 'getFaces', empresaId: empresaId });
+      empleadosCache = data.empleados;
+      motivosEntrada = data.motivosEntrada;
+      motivosSalida = data.motivosSalida;
+      toggleBtn.disabled = false;
+      setStatus(empleadosCache.length
+        ? empleadosCache.length + ' empleado(s) con rostro registrado. Listo para activar la cámara.'
+        : 'Esta empresa no tiene empleados con rostro registrado aún.', empleadosCache.length ? '' : 'warn');
+    } catch (e) {
+      toggleBtn.disabled = true;
+      setStatus('Error cargando empleados: ' + e.message, 'err');
+    }
+  }
+  empresaSelect.addEventListener('change', cargarRostrosEmpresa);
+
+  // ---- Modelos y deteccion facial ----
+  async function asegurarModelos() {
+    if (modelsReady) return true;
+    setStatus('Descargando modelo de reconocimiento (solo la primera vez)...', '');
+    try {
+      await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URL);
+      await faceapi.nets.faceLandmark68Net.loadFromUri(FACE_MODEL_URL);
+      await faceapi.nets.faceRecognitionNet.loadFromUri(FACE_MODEL_URL);
+      modelsReady = true;
+      return true;
+    } catch (e) {
+      setStatus('No se pudo cargar el modelo de reconocimiento. Revisa tu conexión a internet.', 'err');
+      return false;
+    }
+  }
+
+  function distancia(a, b) {
+    let s = 0;
+    for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; }
+    return Math.sqrt(s);
+  }
+  function parseDescriptor(json) {
+    try { const arr = JSON.parse(json); return (Array.isArray(arr) && arr.length) ? new Float32Array(arr) : null; }
+    catch (e) { return null; }
+  }
+  function mejorCoincidencia(descriptor) {
+    let mejor = null, mejorDist = Infinity;
+    empleadosCache.forEach(function (e) {
+      const ref = parseDescriptor(e.faceDescriptor);
+      if (!ref || ref.length !== descriptor.length) return;
+      const d = distancia(ref, descriptor);
+      if (d < mejorDist) { mejorDist = d; mejor = e; }
+    });
+    return (mejor && mejorDist < FACE_MATCH_THRESHOLD) ? mejor : null;
+  }
+
+  async function iniciarCamara() {
+    const ok = await asegurarModelos();
+    if (!ok) return;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+    } catch (e) {
+      setStatus('No se pudo acceder a la cámara. Revisa los permisos del navegador.', 'err');
+      return;
+    }
+    video.srcObject = stream;
+    toggleBtn.textContent = 'Detener cámara';
+    empresaSelect.disabled = true;
+    setStatus('Buscando un rostro frente a la cámara...', '');
+    ciclo();
+  }
+
+  function detenerCamara() {
+    if (loopTimer) clearTimeout(loopTimer);
+    loopTimer = null;
+    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+    video.srcObject = null;
+    toggleBtn.textContent = 'Activar cámara';
+    empresaSelect.disabled = false;
+    setStatus('Cámara detenida.', '');
+  }
+
+  toggleBtn.addEventListener('click', function () {
+    if (stream) detenerCamara(); else iniciarCamara();
+  });
+
+  async function ciclo() {
+    if (!stream) return;
+    if (!procesando) {
+      try {
+        const opciones = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+        const det = await faceapi.detectSingleFace(video, opciones).withFaceLandmarks().withFaceDescriptor();
+        if (det) {
+          const match = mejorCoincidencia(det.descriptor);
+          if (match) {
+            const ahora = Date.now();
+            if (ultimoMatchId !== match.id || (ahora - ultimoMatchDesde) > RECONOCIMIENTO_COOLDOWN_MS) {
+              ultimoMatchId = match.id;
+              ultimoMatchDesde = ahora;
+              procesando = true;
+              await registrar(match);
+              procesando = false;
+            } else {
+              setStatus('Rostro reconocido: ' + match.nombre + ' (ya registrado hace poco)', 'ok');
+            }
+          } else {
+            setStatus('Rostro detectado, pero no coincide con ningún empleado.', 'warn');
+          }
+        } else {
+          setStatus('Buscando un rostro frente a la cámara...', '');
+        }
+      } catch (e) { /* frame fallido, se reintenta */ }
+    }
+    loopTimer = setTimeout(ciclo, 700);
+  }
+
+  async function registrar(emp) {
+    setStatus('Registrando a ' + emp.nombre + '...', '');
+    try {
+      const motivoE = motivosEntrada[0] ? motivosEntrada[0].id : '';
+      const motivoS = motivosSalida[0] ? motivosSalida[0].id : '';
+      const data = await callBackend({
+        action: 'registrarPorRostro',
+        empresaId: empresaSelect.value,
+        empleadoId: emp.id,
+        motivoEntradaId: motivoE,
+        motivoSalidaId: motivoS,
+      });
+      setStatus((data.tipo === 'Entrada' ? '✅ Entrada' : '➡️ Salida') + ' registrada: ' + data.nombre + ' — ' + data.hora, 'ok');
+      agregarAlLog(data);
+    } catch (e) {
+      setStatus('No se pudo registrar: ' + e.message, 'err');
+    }
+  }
+
+  function agregarAlLog(data) {
+    if (logEl.firstElementChild && logEl.firstElementChild.style.color === 'rgb(148, 163, 184)') logEl.innerHTML = '';
+    const div = document.createElement('div');
+    div.className = 'log-item';
+    div.innerHTML = '<span>' + data.nombre + '</span><span><span class="tag ' + (data.tipo === 'Entrada' ? 'ent' : 'sal') + '">' + data.tipo + '</span> · ' + data.hora + '</span>';
+    logEl.insertBefore(div, logEl.firstChild);
+  }
+
+  cargarEmpresas();
+</script>
+</body>
+</html>
